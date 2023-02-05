@@ -173,7 +173,7 @@ public class RestSendToExtensionAction extends BaseRestHandler {
                 new ExtensionRestRequest(method, path, params, contentType, content, requestIssuerIdentity),
                 restExecuteOnExtensionResponseHandler
             );
-            inProgressFuture.orTimeout(ExtensionsManager.EXTENSION_REQUEST_WAIT_TIMEOUT, TimeUnit.SECONDS).join();
+            inProgressFuture.orTimeout(ExtensionsManager.EXTENSION_REQUEST_WAIT_TIMEOUT * 6, TimeUnit.SECONDS).join();
         } catch (CompletionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof TimeoutException) {

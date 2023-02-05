@@ -483,6 +483,7 @@ public class ExtensionsManager {
             @Override
             public void handleResponse(IndicesModuleResponse response) {
                 logger.info("received {}", response);
+                /*-
                 if (response.getIndexEventListener() == true) {
                     indexModule.addIndexEventListener(new IndexEventListener() {
                         @Override
@@ -514,8 +515,11 @@ public class ExtensionsManager {
                         }
                     });
                 } else {
+                */
                     inProgressFuture.complete(response);
+                /*-
                 }
+                */
             }
 
             @Override
