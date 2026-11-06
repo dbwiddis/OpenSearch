@@ -178,7 +178,8 @@ public class MockNode extends Node {
         TaskResourceTrackingService taskResourceTrackingService,
         Collection<ConcurrentSearchRequestDecider.Factory> concurrentSearchDeciderFactories,
         List<SearchPlugin.ProfileMetricsProvider> pluginProfilers,
-        WorkloadGroupService workloadGroupService
+        WorkloadGroupService workloadGroupService,
+        List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors
     ) {
         if (getPluginsService().filterPlugins(MockSearchService.TestPlugin.class).isEmpty()) {
             return super.newSearchService(
@@ -195,7 +196,8 @@ public class MockNode extends Node {
                 taskResourceTrackingService,
                 concurrentSearchDeciderFactories,
                 pluginProfilers,
-                workloadGroupService
+                workloadGroupService,
+                indexAwareSearchRequestProcessors
             );
         }
         return new MockSearchService(

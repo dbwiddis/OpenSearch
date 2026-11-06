@@ -327,6 +327,8 @@ public class SearchModule {
 
     private final List<SearchPlugin.ProfileMetricsProvider> pluginProfilerProviders;
 
+    private final List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors;
+
     /**
      * Constructs a new SearchModule object
      * <p>
@@ -358,6 +360,7 @@ public class SearchModule {
         concurrentSearchDeciderFactories = registerConcurrentSearchDeciderFactories(plugins);
         registerQueryCollectorContextSpec(plugins);
         pluginProfilerProviders = registerProfilerProviders(plugins);
+        indexAwareSearchRequestProcessors = registerIndexAwareSearchRequestProcessors(plugins);
     }
 
     private Collection<ConcurrentSearchRequestDecider.Factory> registerConcurrentSearchDeciderFactories(List<SearchPlugin> plugins) {
@@ -1325,6 +1328,16 @@ public class SearchModule {
         return plugins.stream().map(SearchPlugin::getQueryProfileMetricsProvider).filter(Optional::isPresent).map(Optional::get).toList();
     }
 
+    private List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> registerIndexAwareSearchRequestProcessors(
+        List<SearchPlugin> plugins
+    ) {
+        List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> processors = new ArrayList<>();
+        for (SearchPlugin plugin : plugins) {
+            processors.addAll(plugin.getIndexAwareSearchRequestProcessors());
+        }
+        return List.copyOf(processors);
+    }
+
     public FetchPhase getFetchPhase() {
         return new FetchPhase(fetchSubPhases);
     }
@@ -1339,5 +1352,12 @@ public class SearchModule {
 
     public List<SearchPlugin.ProfileMetricsProvider> getPluginProfileMetricsProviders() {
         return pluginProfilerProviders;
+    }
+
+    /**
+     * The {@link org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor}s contributed by the installed plugins.
+     */
+    public List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
+        return indexAwareSearchRequestProcessors;
     }
 }

@@ -591,6 +591,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
             ActionListener<SearchRequest> requestTransformListener = ActionListener.wrap(sr -> {
 
+                maybeApplyIndexAwareSearchRequestProcessors(sr);
+
                 ActionListener<SearchSourceBuilder> rewriteListener = buildRewriteListener(
                     sr,
                     task,
@@ -626,6 +628,62 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
     /** Whether {@code task}'s work is accounted for against a throttle bucket, so a nested search can inherit it. */
     private static boolean isThrottleCounted(final Task task) {
         return task instanceof WorkloadGroupTask && ((WorkloadGroupTask) task).isThrottleCounted();
+    }
+
+    /**
+     * Runs any plugin-registered {@link org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor}s on
+     * {@code searchRequest}'s source, in place. Runs after search pipeline request processors and before the normal
+     * coordinator query rewrite ({@code Rewriteable.rewrite}), so a processor's own output (e.g. a composite query)
+     * still fans out and rewrites normally afterward.
+     * <p>
+     * No-op if there's no source, no registered processors, or this search is itself a sub-search a processor already
+     * produced (see {@link org.opensearch.search.indexaware.SubSearchMarker}) &mdash; otherwise a processor's own
+     * composite query would be processed again every time it issues an internal search, recursively.
+     * <p>
+     * v1: synchronous only. A processor that needs to make an asynchronous call must block for it; see the companion
+     * RFC's Phase 2 for an async finalize hook.
+     */
+    private void maybeApplyIndexAwareSearchRequestProcessors(SearchRequest searchRequest) {
+        final List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> processors = searchService
+            .getIndexAwareSearchRequestProcessors();
+        if (searchRequest.source() == null
+            || processors.isEmpty()
+            || org.opensearch.search.indexaware.SubSearchMarker.isMarked(threadPool.getThreadContext())) {
+            return;
+        }
+        final org.opensearch.search.indexaware.IndexAwareContext indexAwareContext = buildIndexAwareContext(
+            searchRequest,
+            clusterService.state()
+        );
+        SearchSourceBuilder source = searchRequest.source();
+        for (org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor processor : processors) {
+            source = processor.process(source, indexAwareContext);
+        }
+        if (source != searchRequest.source()) {
+            searchRequest.source(source);
+        }
+    }
+
+    /**
+     * Resolves {@code searchRequest}'s concrete local target indices and their current metadata, early &mdash; before the
+     * coordinator query rewrite runs, rather than after it (where index resolution happens today; see {@link #buildRewriteListener}).
+     * Purely a local, in-memory computation over the already-available cluster state: no I/O, so safe to call ahead of time.
+     */
+    private org.opensearch.search.indexaware.IndexAwareContext buildIndexAwareContext(SearchRequest searchRequest, ClusterState clusterState) {
+        final OriginalIndicesAndSearchContextId requestedIndices = extractRequestedIndices(searchRequest, clusterState);
+        final ResolvedIndices.Local.Concrete localConcreteIndices = resolveLocalIndices(
+            requestedIndices.localOriginalIndices,
+            clusterState,
+            new SearchTimeProvider(searchRequest.getOrCreateAbsoluteStartMillis(), System.nanoTime(), System::nanoTime)
+        );
+        final Map<String, IndexMetadata> targetIndices = new HashMap<>();
+        for (Index index : localConcreteIndices.concreteIndices()) {
+            final IndexMetadata metadata = clusterState.metadata().index(index);
+            if (metadata != null) {
+                targetIndices.put(index.getName(), metadata);
+            }
+        }
+        return new org.opensearch.search.indexaware.IndexAwareContext(targetIndices);
     }
 
     /** A {@link TaskId} addressing {@code task} on this node. */

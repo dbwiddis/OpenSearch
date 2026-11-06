@@ -1734,7 +1734,8 @@ public class Node implements Closeable {
                 taskResourceTrackingService,
                 searchModule.getConcurrentSearchRequestDeciderFactories(),
                 searchModule.getPluginProfileMetricsProviders(),
-                workloadGroupService
+                workloadGroupService,
+                searchModule.getIndexAwareSearchRequestProcessors()
             );
 
             final List<PersistentTasksExecutor<?>> tasksExecutors = pluginsService.filterPlugins(PersistentTaskPlugin.class)
@@ -2516,7 +2517,8 @@ public class Node implements Closeable {
         TaskResourceTrackingService taskResourceTrackingService,
         Collection<ConcurrentSearchRequestDecider.Factory> concurrentSearchDeciderFactories,
         List<SearchPlugin.ProfileMetricsProvider> pluginProfilers,
-        WorkloadGroupService workloadGroupService
+        WorkloadGroupService workloadGroupService,
+        List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors
     ) {
         return new SearchService(
             clusterService,
@@ -2532,7 +2534,8 @@ public class Node implements Closeable {
             taskResourceTrackingService,
             concurrentSearchDeciderFactories,
             pluginProfilers,
-            workloadGroupService
+            workloadGroupService,
+            indexAwareSearchRequestProcessors
         );
     }
 

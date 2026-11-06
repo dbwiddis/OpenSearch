@@ -527,6 +527,8 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     private final List<SearchPlugin.ProfileMetricsProvider> pluginProfilers;
 
+    private final List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors;
+
     public SearchService(
         ClusterService clusterService,
         IndicesService indicesService,
@@ -541,7 +543,8 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         TaskResourceTrackingService taskResourceTrackingService,
         Collection<ConcurrentSearchRequestDecider.Factory> concurrentSearchDeciderFactories,
         List<SearchPlugin.ProfileMetricsProvider> pluginProfilers,
-        WorkloadGroupService workloadGroupService
+        WorkloadGroupService workloadGroupService,
+        List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors
     ) {
         Settings settings = clusterService.getSettings();
         this.threadPool = threadPool;
@@ -615,10 +618,18 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         this.concurrentSearchDeciderFactories = concurrentSearchDeciderFactories;
 
         this.pluginProfilers = pluginProfilers;
+        this.indexAwareSearchRequestProcessors = indexAwareSearchRequestProcessors;
 
         // Initialize QueryRewriterRegistry with cluster settings so TermsMergingRewriter
         // can register its settings update consumer
         QueryRewriterRegistry.INSTANCE.initialize(settings, clusterService.getClusterSettings());
+    }
+
+    /**
+     * The {@link org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor}s contributed by installed plugins.
+     */
+    public List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
+        return indexAwareSearchRequestProcessors;
     }
 
     private void validateKeepAlives(TimeValue defaultKeepAlive, TimeValue maxKeepAlive) {

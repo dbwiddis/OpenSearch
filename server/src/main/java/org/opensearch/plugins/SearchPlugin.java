@@ -245,6 +245,18 @@ public interface SearchPlugin {
     }
 
     /**
+     * The {@link org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor}s added by this
+     * plugin. Each runs once per request, after any search pipeline request processors and before the
+     * coordinator query rewrite, with resolved, per-index mapping context \u2014 see
+     * {@link org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor} for details.
+     *
+     * @opensearch.experimental
+     */
+    default List<org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
+        return emptyList();
+    }
+
+    /**
      * Plugin Profiler provider
      */
     interface ProfileMetricsProvider {
