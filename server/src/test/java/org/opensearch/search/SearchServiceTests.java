@@ -683,6 +683,40 @@ public class SearchServiceTests extends OpenSearchSingleNodeTestCase {
         }
     }
 
+    public void testIndexAwareSearchRequestProcessorsEnabledSetting() {
+        final SearchService service = getInstanceFromNode(SearchService.class);
+
+        // off by default
+        assertFalse(service.isIndexAwareSearchRequestProcessorsEnabled());
+
+        // dynamically enabled using cluster setting, no restart required
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setTransientSettings(
+                Settings.builder().put(SearchService.INDEX_AWARE_SEARCH_REQUEST_PROCESSORS_ENABLED_SETTING.getKey(), true)
+            )
+            .get();
+        assertTrue(service.isIndexAwareSearchRequestProcessorsEnabled());
+
+        // dynamically disabled again
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setTransientSettings(
+                Settings.builder().put(SearchService.INDEX_AWARE_SEARCH_REQUEST_PROCESSORS_ENABLED_SETTING.getKey(), false)
+            )
+            .get();
+        assertFalse(service.isIndexAwareSearchRequestProcessorsEnabled());
+
+        // cleanup
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setTransientSettings(Settings.builder().putNull(SearchService.INDEX_AWARE_SEARCH_REQUEST_PROCESSORS_ENABLED_SETTING.getKey()))
+            .get();
+    }
+
     /**
      * test that getting more than the allowed number of script_fields throws an exception
      */
