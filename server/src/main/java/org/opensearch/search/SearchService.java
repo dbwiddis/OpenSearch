@@ -125,6 +125,10 @@ import org.opensearch.search.fetch.subphase.FetchDocValuesContext;
 import org.opensearch.search.fetch.subphase.FetchFieldsContext;
 import org.opensearch.search.fetch.subphase.ScriptFieldsContext.ScriptField;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.opensearch.search.indexaware.IndexAwareContext;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestScope;
+import org.opensearch.search.indexaware.IndexMappingSourceCache;
 import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.InternalScrollSearchRequest;
 import org.opensearch.search.internal.LegacyReaderContext;
@@ -542,6 +546,15 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     private final List<SearchPlugin.ProfileMetricsProvider> pluginProfilers;
 
+    private final List<IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors;
+
+    // Precomputed once, not per request: the processors list is fixed for this SearchService's lifetime,
+    // so there's no need to re-scan it on every search just to decide whether an internal search can skip
+    // the hook outright.
+    private final boolean anyIndexAwareSearchRequestProcessorAppliesToInternalSearches;
+
+    private final IndexMappingSourceCache indexMappingSourceCache = new IndexMappingSourceCache();
+
     private volatile boolean indexAwareSearchRequestProcessorsEnabled;
 
     public SearchService(
@@ -558,7 +571,8 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         TaskResourceTrackingService taskResourceTrackingService,
         Collection<ConcurrentSearchRequestDecider.Factory> concurrentSearchDeciderFactories,
         List<SearchPlugin.ProfileMetricsProvider> pluginProfilers,
-        WorkloadGroupService workloadGroupService
+        WorkloadGroupService workloadGroupService,
+        List<IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors
     ) {
         Settings settings = clusterService.getSettings();
         this.threadPool = threadPool;
@@ -633,12 +647,24 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
         this.pluginProfilers = pluginProfilers;
 
+        this.indexAwareSearchRequestProcessors = indexAwareSearchRequestProcessors;
+        this.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches = indexAwareSearchRequestProcessors.stream()
+            .anyMatch(IndexAwareSearchRequestProcessor::appliesToInternalSearches);
         this.indexAwareSearchRequestProcessorsEnabled = INDEX_AWARE_SEARCH_REQUEST_PROCESSORS_ENABLED_SETTING.get(settings);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(
                 INDEX_AWARE_SEARCH_REQUEST_PROCESSORS_ENABLED_SETTING,
                 this::setIndexAwareSearchRequestProcessorsEnabled
             );
+        if (indexAwareSearchRequestProcessors.isEmpty() == false) {
+            // Nothing else evicts a deleted index's parsed mapping: the cache holds one entry per index
+            // it has been asked about, for as long as that index exists.
+            clusterService.addListener(event -> {
+                for (Index deleted : event.indicesDeleted()) {
+                    indexMappingSourceCache.remove(deleted);
+                }
+            });
+        }
 
         // Initialize QueryRewriterRegistry with cluster settings so TermsMergingRewriter
         // can register its settings update consumer
@@ -655,6 +681,35 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
      */
     public boolean isIndexAwareSearchRequestProcessorsEnabled() {
         return indexAwareSearchRequestProcessorsEnabled;
+    }
+
+    /**
+     * The {@link IndexAwareSearchRequestProcessor}s contributed by
+     * installed plugins, or an empty list if {@link #isIndexAwareSearchRequestProcessorsEnabled()} is
+     * {@code false} &mdash; so a disabled cluster pays no per-request cost for processors it isn't using,
+     * not even iterating an empty list built from a non-empty one.
+     */
+    public List<IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
+        return indexAwareSearchRequestProcessorsEnabled ? indexAwareSearchRequestProcessors : Collections.emptyList();
+    }
+
+    /**
+     * Whether any registered {@link IndexAwareSearchRequestProcessor} opted in to run even for a search
+     * {@link IndexAwareSearchRequestScope#isInternalByDefault} classifies
+     * as internal. Precomputed once at construction, not re-scanned per request, so the common case (a
+     * {@code BulkByScrollTask} parent, no opted-in processor) can skip resolving indices at all.
+     */
+    public boolean anyIndexAwareSearchRequestProcessorAppliesToInternalSearches() {
+        return anyIndexAwareSearchRequestProcessorAppliesToInternalSearches;
+    }
+
+    /**
+     * The node-level cache backing {@link IndexAwareContext#getMappingSourceAsMap}
+     * for every {@link IndexAwareSearchRequestProcessor} invocation on this node: one instance for the
+     * node's lifetime, so a mapping is parsed once per (index UUID, mapping version), not once per request.
+     */
+    public IndexMappingSourceCache getIndexMappingSourceCache() {
+        return indexMappingSourceCache;
     }
 
     private void validateKeepAlives(TimeValue defaultKeepAlive, TimeValue maxKeepAlive) {

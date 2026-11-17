@@ -68,6 +68,7 @@ import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
 import org.opensearch.search.deciders.ConcurrentSearchRequestDecider;
 import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.fetch.subphase.highlight.Highlighter;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.profile.ProfileMetric;
 import org.opensearch.search.query.QueryCollectorContextSpecFactory;
@@ -241,6 +242,18 @@ public interface SearchPlugin {
     }
 
     default List<QueryCollectorContextSpecFactory> getCollectorContextSpecFactories() {
+        return emptyList();
+    }
+
+    /**
+     * The {@link IndexAwareSearchRequestProcessor}s added by this
+     * plugin. Each runs once per request, after any search pipeline request processors and before the
+     * coordinator query rewrite, with resolved, per-index mapping context &mdash; see
+     * {@link IndexAwareSearchRequestProcessor} for details.
+     *
+     * @opensearch.internal
+     */
+    default List<IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
         return emptyList();
     }
 

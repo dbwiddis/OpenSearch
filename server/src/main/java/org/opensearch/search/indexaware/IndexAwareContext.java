@@ -16,7 +16,7 @@ import java.util.Collections;
 import java.util.Map;
 
 /**
- * Index-aware context passed to an {@code IndexAwareSearchRequestProcessor}: the concrete local indices a
+ * Index-aware context passed to an {@link IndexAwareSearchRequestProcessor}: the concrete local indices a
  * search request targets, resolved before the coordinator query rewrite runs, with their current metadata
  * (including mappings).
  * <p>
@@ -25,7 +25,7 @@ import java.util.Map;
  * concrete index name before deciding to act.
  * <p>
  * Not thread-safe: one instance is built per request and handed to each registered processor in turn. With
- * the listener-based {@code IndexAwareSearchRequestProcessor#process}, that's not necessarily the same
+ * the listener-based {@link IndexAwareSearchRequestProcessor#process}, that's not necessarily the same
  * thread for every processor, but it is still strictly one processor at a time, never concurrently.
  *
  * @opensearch.internal

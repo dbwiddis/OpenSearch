@@ -14,7 +14,7 @@ import java.util.Collection;
 import java.util.Collections;
 
 /**
- * Marks a search as a sub-search that {@code IndexAwareSearchRequestProcessor}s must not process again.
+ * Marks a search as a sub-search that {@link IndexAwareSearchRequestProcessor}s must not process again.
  * <p>
  * A processor's own output may be (or contain) a composite query that, when executed, issues further
  * internal searches &mdash; for example, a fused {@code hybrid} query's per-leg searches and its count

@@ -105,6 +105,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.FetchSearchResult;
 import org.opensearch.search.fetch.ShardFetchRequest;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
 import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.ReaderContext;
 import org.opensearch.search.internal.SearchContext;
@@ -164,7 +165,8 @@ public class SearchServiceTests extends OpenSearchSingleNodeTestCase {
             CustomScriptPlugin.class,
             ReaderWrapperCountPlugin.class,
             InternalOrPrivateSettingsPlugin.class,
-            MockSearchService.TestPlugin.class
+            MockSearchService.TestPlugin.class,
+            IndexAwareSearchRequestProcessorTestPlugin.class
         );
     }
 
@@ -172,6 +174,13 @@ public class SearchServiceTests extends OpenSearchSingleNodeTestCase {
         @Override
         public void onIndexModule(IndexModule indexModule) {
             indexModule.setReaderWrapper(service -> SearchServiceTests::apply);
+        }
+    }
+
+    public static class IndexAwareSearchRequestProcessorTestPlugin extends Plugin implements SearchPlugin {
+        @Override
+        public List<IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
+            return List.of((source, context, listener) -> listener.onResponse(source));
         }
     }
 
@@ -686,8 +695,11 @@ public class SearchServiceTests extends OpenSearchSingleNodeTestCase {
     public void testIndexAwareSearchRequestProcessorsEnabledSetting() {
         final SearchService service = getInstanceFromNode(SearchService.class);
 
-        // off by default
+        // off by default: the plugin-registered processor (IndexAwareSearchRequestProcessorTestPlugin) is
+        // installed, but the gated getter still returns empty so a disabled cluster pays no per-request
+        // cost iterating a list it isn't using.
         assertFalse(service.isIndexAwareSearchRequestProcessorsEnabled());
+        assertTrue(service.getIndexAwareSearchRequestProcessors().isEmpty());
 
         // dynamically enabled using cluster setting, no restart required
         client().admin()
@@ -698,6 +710,7 @@ public class SearchServiceTests extends OpenSearchSingleNodeTestCase {
             )
             .get();
         assertTrue(service.isIndexAwareSearchRequestProcessorsEnabled());
+        assertEquals(1, service.getIndexAwareSearchRequestProcessors().size());
 
         // dynamically disabled again
         client().admin()
@@ -708,6 +721,7 @@ public class SearchServiceTests extends OpenSearchSingleNodeTestCase {
             )
             .get();
         assertFalse(service.isIndexAwareSearchRequestProcessorsEnabled());
+        assertTrue(service.getIndexAwareSearchRequestProcessors().isEmpty());
 
         // cleanup
         client().admin()

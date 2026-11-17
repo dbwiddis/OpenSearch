@@ -18,14 +18,14 @@ import java.util.Collection;
 import java.util.Map;
 
 /**
- * Decides whether an {@code IndexAwareSearchRequestProcessor} should run for a given search request at all:
+ * Decides whether an {@link IndexAwareSearchRequestProcessor} should run for a given search request at all:
  * {@link #isInternalByDefault} classifies searches whose rewrite isn't safe to apply by default (part of a
  * job that reuses this search's resolution for later batches, or targeting an index user-facing rewrite
  * logic isn't meant to touch), and {@link #hasRemoteIndices} flags cross-cluster searches this hook's
  * local-only resolution can't safely act on.
  * <p>
  * A processor that still wants to run for an internal search must opt in; see
- * {@code IndexAwareSearchRequestProcessor#appliesToInternalSearches()}.
+ * {@link IndexAwareSearchRequestProcessor#appliesToInternalSearches()}.
  *
  * @opensearch.internal
  */

@@ -77,6 +77,7 @@ import org.opensearch.search.fetch.subphase.highlight.FastVectorHighlighter;
 import org.opensearch.search.fetch.subphase.highlight.Highlighter;
 import org.opensearch.search.fetch.subphase.highlight.PlainHighlighter;
 import org.opensearch.search.fetch.subphase.highlight.UnifiedHighlighter;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
 import org.opensearch.search.profile.Timer;
 import org.opensearch.search.query.ConcurrentQueryPhaseSearcher;
 import org.opensearch.search.query.QueryPhase;
@@ -434,6 +435,18 @@ public class SearchModuleTests extends OpenSearchTestCase {
         List<SearchPlugin.ProfileMetricsProvider> providers = module.getPluginProfileMetricsProviders();
         assertThat(providers, hasSize(1));
         assertEquals(providers.getFirst().getQueryProfileMetrics(null, null).size(), 1);
+    }
+
+    public void testIndexAwareSearchRequestProcessors() {
+        IndexAwareSearchRequestProcessor processor = (source, context, listener) -> listener.onResponse(source);
+        SearchModule module = new SearchModule(Settings.EMPTY, singletonList(new SearchPlugin() {
+            @Override
+            public List<IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
+                return singletonList(processor);
+            }
+        }));
+
+        assertEquals(singletonList(processor), module.getIndexAwareSearchRequestProcessors());
     }
 
     public void testDefaultQueryPhaseSearcher() {
