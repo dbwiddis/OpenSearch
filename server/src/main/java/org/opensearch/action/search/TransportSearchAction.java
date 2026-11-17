@@ -633,12 +633,32 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         return new TaskId(clusterService.localNode().getId(), task.getId());
     }
 
-    private Task extractParentTask(final SearchRequest searchRequest) {
-        TaskId taskId = searchRequest.getParentTask();
-        if (taskId != null && taskId != TaskId.EMPTY_TASK_ID) {
-            return taskManager.getTask(taskId.getId());
+    /**
+     * The task running locally for {@code taskId}, or {@code null} if {@code taskId} is empty, isn't
+     * local to this node, or isn't currently tracked here.
+     * <p>
+     * Checks {@link TaskId#getNodeId()} against this node before looking anything up: {@code taskManager}
+     * only ever knows about tasks running on this node, keyed by a numeric id that's only unique per node,
+     * not across the cluster. Looking up a remote {@code TaskId}'s numeric part alone, without checking
+     * whether it's actually supposed to be local, risks silently matching an unrelated local task that
+     * happens to reuse the same number -- numeric id collisions across different nodes' counters are
+     * expected, not rare. The existing (lower-stakes) caller of this, search-pipeline system-generated
+     * processor resolution, already had this gap; {@code IndexAwareSearchRequestScope#isInternalByDefault}
+     * makes a correctness decision from the result (whether a rewrite might change which documents a
+     * by-query job touches), which raises the stakes of getting it wrong.
+     */
+    private Task localTask(final TaskId taskId) {
+        if (taskId == null || taskId == TaskId.EMPTY_TASK_ID) {
+            return null;
         }
-        return null;
+        if (taskId.getNodeId().equals(clusterService.localNode().getId()) == false) {
+            return null;
+        }
+        return taskManager.getTask(taskId.getId());
+    }
+
+    private Task extractParentTask(final SearchRequest searchRequest) {
+        return localTask(searchRequest.getParentTask());
     }
 
     private ActionListener<SearchSourceBuilder> buildRewriteListener(
