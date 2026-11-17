@@ -44,6 +44,7 @@ import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsResponse;
 import org.opensearch.action.search.pruning.FieldDomainEvaluationContext;
 import org.opensearch.action.search.pruning.SearchIndexPruningResult;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.TimeoutTaskCancellationUtility;
@@ -62,22 +63,30 @@ import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AtomicArray;
 import org.opensearch.common.util.concurrent.CountDown;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
+import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.fielddomain.ClusterStateFieldDomainProvider;
 import org.opensearch.index.query.Rewriteable;
+import org.opensearch.index.reindex.BulkByScrollTask;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.search.SearchPhaseResult;
 import org.opensearch.search.SearchService;
@@ -85,6 +94,10 @@ import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.indexaware.IndexAwareContext;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestScope;
+import org.opensearch.search.indexaware.SubSearchMarker;
 import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.search.internal.SearchContext;
@@ -115,11 +128,14 @@ import org.opensearch.transport.client.OriginSettingClient;
 import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.wlm.WorkloadGroupTask;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -127,11 +143,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
@@ -580,8 +598,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
             PipelinedRequest searchRequest;
             ActionListener<SearchResponse> listener;
+            final Task parentTask;
             try {
-                final Task parentTask = extractParentTask(originalSearchRequest);
+                parentTask = extractParentTask(originalSearchRequest);
                 searchRequest = searchPipelineService.resolvePipeline(originalSearchRequest, parentTask, indexNameExpressionResolver);
                 listener = searchRequest.transformResponseListener(updatedListener);
             } catch (Exception e) {
@@ -591,28 +610,31 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
             ActionListener<SearchRequest> requestTransformListener = ActionListener.wrap(sr -> {
 
-                ActionListener<SearchSourceBuilder> rewriteListener = buildRewriteListener(
-                    sr,
-                    task,
-                    timeProvider,
-                    searchAsyncActionProvider,
-                    listener,
-                    searchRequestContext
-                );
-                if (sr.source() == null) {
-                    rewriteListener.onResponse(sr.source());
-                } else {
-                    Rewriteable.rewriteAndFetch(
-                        sr.source(),
-                        // Parent rewrite searches on this task only when it is counted, so a nested search isn't charged twice.
-                        searchService.getRewriteContext(
-                            timeProvider::getAbsoluteStartMillis,
-                            searchRequest,
-                            isThrottleCounted(task) ? localTaskId(task) : TaskId.EMPTY_TASK_ID
-                        ),
-                        rewriteListener
+                final Runnable continueWithRewrite = () -> {
+                    ActionListener<SearchSourceBuilder> rewriteListener = buildRewriteListener(
+                        sr,
+                        task,
+                        timeProvider,
+                        searchAsyncActionProvider,
+                        listener,
+                        searchRequestContext
                     );
-                }
+                    if (sr.source() == null) {
+                        rewriteListener.onResponse(sr.source());
+                    } else {
+                        Rewriteable.rewriteAndFetch(
+                            sr.source(),
+                            // Parent rewrite searches on this task only when it is counted, so a nested search isn't charged twice.
+                            searchService.getRewriteContext(
+                                timeProvider::getAbsoluteStartMillis,
+                                searchRequest,
+                                isThrottleCounted(task) ? localTaskId(task) : TaskId.EMPTY_TASK_ID
+                            ),
+                            rewriteListener
+                        );
+                    }
+                };
+                maybeApplyIndexAwareSearchRequestProcessors(sr, task, parentTask, timeProvider, listener, continueWithRewrite);
             }, listener::onFailure);
             try {
                 searchRequest.transformRequest(requestTransformListener);
@@ -659,6 +681,344 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
     private Task extractParentTask(final SearchRequest searchRequest) {
         return localTask(searchRequest.getParentTask());
+    }
+
+    /**
+     * Runs any plugin-registered {@link IndexAwareSearchRequestProcessor}s on {@code searchRequest}'s source,
+     * then calls {@code onComplete}. Runs after search pipeline request processors and before the normal
+     * coordinator query rewrite ({@code Rewriteable.rewrite}), so a processor's own output (e.g. a composite
+     * query) still fans out and rewrites normally afterward.
+     * <p>
+     * Calls {@code onComplete} directly, on the calling thread, with {@code searchRequest} untouched, when
+     * the hook doesn't apply; see {@link #prepareIndexAwareDispatch}. With no processors registered or the
+     * setting off that costs one volatile read.
+     * <p>
+     * Does not fork onto any thread pool: {@link IndexAwareSearchRequestProcessor#process} is
+     * listener-based, so nothing here ever blocks a thread waiting on a processor.
+     * <p>
+     * Exactly one of {@code onComplete} and {@code listener.onFailure} is called, exactly once, in the
+     * thread context this method was called with. A failure of {@code onComplete} itself (i.e. of the
+     * coordinator rewrite that follows) goes to {@code listener}, and is never attributed to a processor.
+     *
+     * @param searchRequest the request to run processors against
+     * @param task          this search's own task, or {@code null}; processors parent their own requests
+     *                      to it, and a cancelled task stops the chain
+     * @param parentTask    the task that issued this search, or {@code null}; reused from
+     *                      {@link #extractParentTask} rather than re-resolved, to classify
+     *                      {@link IndexAwareSearchRequestScope#isInternalByDefault}
+     * @param timeProvider  this search's own time provider, reused for index resolution rather than a
+     *                      freshly sampled timestamp, so a date-math index name resolves the same way here
+     *                      as it does for the search that actually executes
+     * @param listener      the request's response listener, notified only of failure
+     * @param onComplete    called once processors have run (or been skipped)
+     */
+    // Package-private rather than private, so TransportSearchActionTests can exercise it directly without
+    // the full doExecute pipeline.
+    void maybeApplyIndexAwareSearchRequestProcessors(
+        SearchRequest searchRequest,
+        @Nullable Task task,
+        @Nullable Task parentTask,
+        SearchTimeProvider timeProvider,
+        ActionListener<SearchResponse> listener,
+        Runnable onComplete
+    ) {
+        final IndexAwareDispatch dispatch;
+        try {
+            dispatch = prepareIndexAwareDispatch(searchRequest, task, parentTask, timeProvider);
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
+        if (dispatch == null) {
+            // Deliberately outside the try above, and not guarded here: on this path the hook did nothing,
+            // so a failure of the continuation propagates to the caller exactly as it did before the hook
+            // existed.
+            onComplete.run();
+            return;
+        }
+        // A processor resolves its listener on whatever thread, in whatever thread context, the thing it
+        // waited on completed in: a sub-search's callback runs in that sub-search's context (sub-search
+        // marker included), a plugin's own executor may carry none at all. The rest of this search must
+        // run in this request's context, not that one.
+        final Supplier<ThreadContext.StoredContext> restoreRequestContext = threadPool.getThreadContext().newRestorableContext(false);
+        runIndexAwareSearchRequestProcessors(
+            dispatch.source,
+            dispatch.context,
+            dispatch.processors.iterator(),
+            searchRequest,
+            task,
+            restoreRequestContext,
+            listener,
+            onComplete
+        );
+    }
+
+    /**
+     * What {@link #maybeApplyIndexAwareSearchRequestProcessors} needs to run the hook for one request.
+     * {@code source} is a private copy of the request's source.
+     */
+    private record IndexAwareDispatch(SearchSourceBuilder source, IndexAwareContext context, List<
+        IndexAwareSearchRequestProcessor> processors) {
+    }
+
+    /**
+     * Decides whether the hook applies to {@code searchRequest} and, if so, with which processors and
+     * what context; {@code null} if it doesn't apply. Checks run cheapest first, so a request the hook
+     * doesn't apply to pays as little as possible:
+     * <ol>
+     *   <li>no source, no registered processors (including when
+     *       {@code search.index_aware_search_request_processors.enabled} is {@code false} &mdash; see
+     *       {@link SearchService#getIndexAwareSearchRequestProcessors()}), or a sub-search a processor
+     *       itself issued (see {@link SubSearchMarker});</li>
+     *   <li>a by-query/reindex search no processor opted into, or a search forwarded here by a remote
+     *       CCS coordinator;</li>
+     *   <li>no processor's {@link IndexAwareSearchRequestProcessor#mayApplyTo} accepts the source;</li>
+     *   <li>only then index resolution: any remote index, or a system-index target no remaining processor
+     *       opted into.</li>
+     * </ol>
+     * The source is copied last, only once some processor is actually going to run.
+     */
+    private IndexAwareDispatch prepareIndexAwareDispatch(
+        SearchRequest searchRequest,
+        @Nullable Task task,
+        @Nullable Task parentTask,
+        SearchTimeProvider timeProvider
+    ) {
+        final List<IndexAwareSearchRequestProcessor> registered = searchService.getIndexAwareSearchRequestProcessors();
+        final SearchSourceBuilder source = searchRequest.source();
+        if (source == null || registered.isEmpty() || SubSearchMarker.isMarked(threadPool.getThreadContext())) {
+            return null;
+        }
+        // Known before any index resolution. (The other half of isInternalByDefault, system-index
+        // targets, needs the resolution below.) Precomputed once on SearchService, not rescanned per
+        // request.
+        if (parentTask instanceof BulkByScrollTask
+            && searchService.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches() == false) {
+            return null;
+        }
+        // A search this node is running on behalf of a remote CCS coordinator (a forwarded sub-request,
+        // not a top-level request this node is coordinating): symmetric with the hasRemoteIndices() skip
+        // below, rather than letting only the remote side of a mixed request get rewritten.
+        if (searchRequest.getLocalClusterAlias() != null) {
+            return null;
+        }
+
+        List<IndexAwareSearchRequestProcessor> processors = new ArrayList<>(registered.size());
+        for (IndexAwareSearchRequestProcessor processor : registered) {
+            if (processor.mayApplyTo(source)) {
+                processors.add(processor);
+            }
+        }
+        if (processors.isEmpty()) {
+            return null;
+        }
+
+        // One cluster state for the whole decision: which indices, their metadata, and the node versions.
+        final ClusterState clusterState = clusterService.state();
+        final OriginalIndicesAndSearchContextId requestedIndices = extractRequestedIndices(searchRequest, clusterState);
+        if (IndexAwareSearchRequestScope.hasRemoteIndices(requestedIndices.remoteClusterIndices)) {
+            return null;
+        }
+        final Map<String, IndexMetadata> targetIndices = new HashMap<>();
+        if (requestedIndices.searchContextId != null) {
+            // A point-in-time search targets the concrete indices recorded in the PIT, which executeSearch
+            // uses as they are, without running them through the index name resolver. Do the same here:
+            // resolving them against the current cluster state could reject (index since closed or
+            // deleted) a search that the PIT's still-open shard contexts would otherwise serve.
+            if (requestedIndices.localOriginalIndices != null) {
+                for (String indexName : requestedIndices.localOriginalIndices.indices()) {
+                    final IndexMetadata metadata = clusterState.metadata().index(indexName);
+                    if (metadata != null) {
+                        targetIndices.put(indexName, metadata);
+                    }
+                }
+            }
+        } else {
+            final ResolvedIndices.Local.Concrete concreteIndices = resolveLocalIndices(
+                requestedIndices.localOriginalIndices,
+                clusterState,
+                timeProvider
+            );
+            for (Index index : concreteIndices.concreteIndices()) {
+                final IndexMetadata metadata = clusterState.metadata().index(index);
+                if (metadata != null) {
+                    targetIndices.put(index.getName(), metadata);
+                }
+            }
+        }
+
+        if (IndexAwareSearchRequestScope.isInternalByDefault(parentTask, targetIndices.values())) {
+            processors.removeIf(processor -> processor.appliesToInternalSearches() == false);
+            if (processors.isEmpty()) {
+                return null;
+            }
+        }
+
+        final IndexAwareContext context = new IndexAwareContext(
+            targetIndices,
+            searchService.getIndexMappingSourceCache(),
+            clusterState.nodes().getMinNodeVersion(),
+            task == null ? TaskId.EMPTY_TASK_ID : localTaskId(task)
+        );
+        // A defensive copy: PipelinedRequest shallow-copies its source, so without this, a processor's
+        // in-place mutation (source.query(...)) would reach the SearchRequest object the original caller
+        // passed in, not just this request's own execution -- an in-JVM caller that reuses or retries
+        // that SearchRequest would get the already-rewritten query back.
+        return new IndexAwareDispatch(copySource(source), context, processors);
+    }
+
+    /**
+     * Runs {@code remaining} on {@code source} one at a time, resolving each through its listener before
+     * moving to the next, so a processor that needs to wait on something (a sub-search, a model lookup)
+     * never blocks a thread doing it; then attaches the result to {@code searchRequest} and calls
+     * {@code onComplete}.
+     * <p>
+     * Each processor's listener is deliberately not an {@code ActionListener.wrap(...)}: that routes an
+     * exception thrown by its response handler into its failure handler, and the response handler here is
+     * everything downstream of the processor &mdash; the remaining processors, then {@code onComplete},
+     * i.e. the coordinator rewrite. A rewrite failure would be reported as that processor's failure and
+     * the continuation run again. Instead the continuation's own failures are caught where it is called,
+     * and each processor's listener accepts one resolution only.
+     */
+    private void runIndexAwareSearchRequestProcessors(
+        SearchSourceBuilder source,
+        IndexAwareContext context,
+        Iterator<IndexAwareSearchRequestProcessor> remaining,
+        SearchRequest searchRequest,
+        @Nullable Task task,
+        Supplier<ThreadContext.StoredContext> restoreRequestContext,
+        ActionListener<SearchResponse> listener,
+        Runnable onComplete
+    ) {
+        if (remaining.hasNext() == false) {
+            try {
+                searchRequest.source(source);
+                onComplete.run();
+            } catch (Exception e) {
+                // A processor may have resolved on a thread nothing else is watching, so there is no
+                // caller to propagate to: without this, the request would never get a response.
+                listener.onFailure(e);
+            }
+            return;
+        }
+        if (task instanceof CancellableTask cancellableTask && cancellableTask.isCancelled()) {
+            listener.onFailure(new TaskCancelledException("search was cancelled while running index-aware search request processors"));
+            return;
+        }
+        final IndexAwareSearchRequestProcessor processor = remaining.next();
+        final ActionListener<SearchSourceBuilder> next = ActionListener.notifyOnce(
+            new ContextPreservingActionListener<>(restoreRequestContext, new ActionListener<>() {
+                @Override
+                public void onResponse(SearchSourceBuilder newSource) {
+                    if (newSource == null) {
+                        onFailure(
+                            new IllegalStateException(
+                                "IndexAwareSearchRequestProcessor [" + processor.getName() + "] resolved a null search source"
+                            )
+                        );
+                        return;
+                    }
+                    runIndexAwareSearchRequestProcessors(
+                        newSource,
+                        context,
+                        remaining,
+                        searchRequest,
+                        task,
+                        restoreRequestContext,
+                        listener,
+                        onComplete
+                    );
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    if (processor.ignoreFailure() && mustFailSearch(e) == false) {
+                        logIgnoredIndexAwareProcessorFailure(processor, e);
+                        runIndexAwareSearchRequestProcessors(
+                            source,
+                            context,
+                            remaining,
+                            searchRequest,
+                            task,
+                            restoreRequestContext,
+                            listener,
+                            onComplete
+                        );
+                    } else {
+                        listener.onFailure(e);
+                    }
+                }
+            })
+        );
+        try {
+            processor.process(source, context, next);
+        } catch (Exception e) {
+            // If the processor had already resolved its listener, this is a no-op (notifyOnce), not a
+            // second run of everything downstream.
+            next.onFailure(e);
+        }
+    }
+
+    /**
+     * Failures that say this node can't do the work right now, rather than that a processor is broken:
+     * never swallowed by {@link IndexAwareSearchRequestProcessor#ignoreFailure()}.
+     */
+    private static boolean mustFailSearch(Exception e) {
+        final Throwable cause = ExceptionsHelper.unwrapCause(e);
+        return cause instanceof TaskCancelledException
+            || cause instanceof CircuitBreakingException
+            || cause instanceof OpenSearchRejectedExecutionException;
+    }
+
+    private static final long IGNORED_PROCESSOR_FAILURE_LOG_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+
+    // Starts one interval in the past, so the first ignored failure is always logged.
+    private final AtomicLong lastIgnoredProcessorFailureLogNanos = new AtomicLong(
+        System.nanoTime() - IGNORED_PROCESSOR_FAILURE_LOG_INTERVAL_NANOS
+    );
+
+    /**
+     * At most one WARN (with the stack trace) a minute across all processors, DEBUG otherwise: a processor
+     * that fails on every request would otherwise write a stack trace per search.
+     */
+    private void logIgnoredIndexAwareProcessorFailure(IndexAwareSearchRequestProcessor processor, Exception e) {
+        final long now = System.nanoTime();
+        final long last = lastIgnoredProcessorFailureLogNanos.get();
+        if (now - last >= IGNORED_PROCESSOR_FAILURE_LOG_INTERVAL_NANOS && lastIgnoredProcessorFailureLogNanos.compareAndSet(last, now)) {
+            logger.warn(
+                () -> new ParameterizedMessage(
+                    "IndexAwareSearchRequestProcessor [{}] failed and is configured to ignore failures; continuing without it "
+                        + "(further failures are logged at DEBUG for the next minute)",
+                    processor.getName()
+                ),
+                e
+            );
+        } else {
+            logger.debug(
+                () -> new ParameterizedMessage("IndexAwareSearchRequestProcessor [{}] failed, continuing without it", processor.getName()),
+                e
+            );
+        }
+    }
+
+    /**
+     * A deep copy of {@code source}, via a stream round trip: {@code SearchSourceBuilder} has no copy
+     * constructor, and a shallow {@code new SearchSourceBuilder()} plus field-by-field copying would need
+     * to track every field this class has, forever. The round trip only ever needs
+     * {@link #namedWriteableRegistry} to resolve nested {@code NamedWriteable}s (query builders); nothing
+     * about it is specific to this node or this moment, so it's as safe as any other in-JVM (de)serialize
+     * copy already used throughout this codebase.
+     */
+    private SearchSourceBuilder copySource(SearchSourceBuilder source) {
+        try {
+            final BytesStreamOutput out = new BytesStreamOutput();
+            source.writeTo(out);
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), namedWriteableRegistry)) {
+                return new SearchSourceBuilder(in);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     private ActionListener<SearchSourceBuilder> buildRewriteListener(

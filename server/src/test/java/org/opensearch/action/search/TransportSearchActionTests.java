@@ -47,6 +47,7 @@ import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsGroup;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsResponse;
 import org.opensearch.action.admin.indices.stats.SearchResponseStatusStats;
+import org.opensearch.action.search.TransportSearchAction.SearchTimeProvider;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.cluster.ClusterName;
@@ -59,6 +60,7 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.GroupShardsIterator;
 import org.opensearch.cluster.routing.GroupShardsIteratorTests;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -83,6 +85,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitBuilder;
@@ -91,6 +94,8 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.index.reindex.ReindexAction;
+import org.opensearch.index.reindex.ReindexRequest;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.rest.action.search.RestSearchAction;
 import org.opensearch.search.Scroll;
@@ -103,6 +108,10 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
+import org.opensearch.search.indexaware.IndexAwareContext;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
+import org.opensearch.search.indexaware.IndexMappingSourceCache;
+import org.opensearch.search.indexaware.SubSearchMarker;
 import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.search.internal.SearchContext;
@@ -161,6 +170,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -2061,6 +2071,569 @@ public class TransportSearchActionTests extends OpenSearchTestCase {
             for (MockTransportService mockTransportService : mockTransportServices) {
                 mockTransportService.close();
             }
+        }
+    }
+
+    // No registered processors (e.g. the setting is off, or no plugin registered one): no-op, and the
+    // request keeps its original source instance (not just an equal one).
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsNoProcessorsIsANoOp() {
+        withIndexAwareTestAction((action, searchService) -> {
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(Collections.emptyList());
+            SearchRequest ordinarySearch = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            SearchSourceBuilder original = ordinarySearch.source();
+            runAndAwait(action, ordinarySearch, null);
+            assertSame(original, ordinarySearch.source());
+        });
+    }
+
+    // Ordinary search, one processor registered: it runs, sees the resolved target index, and its result
+    // is attached back to the request.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsRunsARegisteredProcessor() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                invocations.incrementAndGet();
+                assertTrue("my-index should be in the resolved target indices", context.getTargetIndices().containsKey("my-index"));
+                listener.onResponse(rewritten);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(recordingProcessor));
+            SearchRequest searchWithProcessor = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            runAndAwait(action, searchWithProcessor, null);
+            assertSame(rewritten, searchWithProcessor.source());
+            assertEquals(1, invocations.get());
+        });
+    }
+
+    // Internal search (BulkByScrollTask parent, e.g. _reindex): default-skipped.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsSkipsAnInternalSearchByDefault() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                invocations.incrementAndGet();
+                listener.onResponse(rewritten);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(recordingProcessor));
+            Task reindexParentTask = new ReindexRequest().createTask(1, "transport", ReindexAction.NAME, TaskId.EMPTY_TASK_ID, Map.of());
+            SearchRequest internalSearch = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            SearchSourceBuilder original = internalSearch.source();
+            runAndAwait(action, internalSearch, reindexParentTask);
+            assertSame(original, internalSearch.source());
+            assertEquals(0, invocations.get());
+        });
+    }
+
+    // Internal search, but the processor opted in via appliesToInternalSearches(): runs anyway.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsRunsOnAnInternalSearchWhenOptedIn() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor optedInProcessor = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    invocations.incrementAndGet();
+                    listener.onResponse(rewritten);
+                }
+
+                @Override
+                public boolean appliesToInternalSearches() {
+                    return true;
+                }
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(optedInProcessor));
+            when(searchService.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches()).thenReturn(true);
+            Task reindexParentTask = new ReindexRequest().createTask(1, "transport", ReindexAction.NAME, TaskId.EMPTY_TASK_ID, Map.of());
+            SearchRequest internalSearchOptedIn = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            runAndAwait(action, internalSearchOptedIn, reindexParentTask);
+            assertSame(rewritten, internalSearchOptedIn.source());
+            assertEquals(1, invocations.get());
+        });
+    }
+
+    // A system-index target: default-skipped, the other half of isInternalByDefault that doesn't need a
+    // BulkByScrollTask parent at all.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsSkipsASystemIndexByDefault() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                invocations.incrementAndGet();
+                listener.onResponse(rewritten);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(recordingProcessor));
+            SearchRequest systemIndexSearch = new SearchRequest(".system-index").source(new SearchSourceBuilder());
+            SearchSourceBuilder original = systemIndexSearch.source();
+            runAndAwait(action, systemIndexSearch, null);
+            assertSame(original, systemIndexSearch.source());
+            assertEquals(0, invocations.get());
+        });
+    }
+
+    // A search already marked as a sub-search (e.g. a composite query's own leg search): skipped,
+    // regardless of registered processors, to avoid re-processing a processor's own output.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsSkipsASubSearch() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                invocations.incrementAndGet();
+                listener.onResponse(rewritten);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(recordingProcessor));
+            try (ThreadContext.StoredContext ignored = SubSearchMarker.markForSubSearch(threadPool.getThreadContext())) {
+                SearchRequest subSearch = new SearchRequest("my-index").source(new SearchSourceBuilder());
+                SearchSourceBuilder original = subSearch.source();
+                runAndAwait(action, subSearch, null);
+                assertSame(original, subSearch.source());
+                assertEquals(0, invocations.get());
+            }
+        });
+    }
+
+    // A processor that throws doesn't fail the whole search: it's skipped (logged by name), and the
+    // remaining processors still run against the source unchanged by the one that failed.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsFailsTheSearchWhenAProcessorThrows() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger laterInvocations = new AtomicInteger();
+            IndexAwareSearchRequestProcessor throwingProcessor = (source, context, listener) -> {
+                throw new RuntimeException("processor boom");
+            };
+            IndexAwareSearchRequestProcessor laterProcessor = (source, context, listener) -> {
+                laterInvocations.incrementAndGet();
+                listener.onResponse(source);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(throwingProcessor, laterProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicInteger completions = new AtomicInteger();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), failure::set),
+                completions::incrementAndGet
+            );
+            assertNotNull(failure.get());
+            assertEquals("processor boom", failure.get().getMessage());
+            assertEquals(0, completions.get());
+            assertEquals(0, laterInvocations.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsSkipsAFailingProcessorThatIgnoresFailure() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor failingProcessor = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    listener.onFailure(new RuntimeException("processor boom"));
+                }
+
+                @Override
+                public boolean ignoreFailure() {
+                    return true;
+                }
+            };
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                invocations.incrementAndGet();
+                listener.onResponse(rewritten);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(failingProcessor, recordingProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            runAndAwait(action, searchRequest, null);
+            assertSame(rewritten, searchRequest.source());
+            assertEquals(1, invocations.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsNeverIgnoresACancellation() {
+        withIndexAwareTestAction((action, searchService) -> {
+            IndexAwareSearchRequestProcessor failingProcessor = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    listener.onFailure(new TaskCancelledException("cancelled"));
+                }
+
+                @Override
+                public boolean ignoreFailure() {
+                    return true;
+                }
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(failingProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicInteger completions = new AtomicInteger();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), failure::set),
+                completions::incrementAndGet
+            );
+            assertThat(failure.get(), instanceOf(TaskCancelledException.class));
+            assertEquals(0, completions.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsSkipsWhenNoProcessorMayApply() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            IndexAwareSearchRequestProcessor uninterested = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    invocations.incrementAndGet();
+                    listener.onResponse(source);
+                }
+
+                @Override
+                public boolean mayApplyTo(SearchSourceBuilder source) {
+                    return false;
+                }
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(uninterested));
+            SearchSourceBuilder original = new SearchSourceBuilder();
+            // An index that doesn't exist: if the hook resolved indices at all, this would throw.
+            SearchRequest searchRequest = new SearchRequest("no-such-index").source(original);
+            runAndAwait(action, searchRequest, null);
+            // Not copied either: the request keeps the caller's own source instance.
+            assertSame(original, searchRequest.source());
+            assertEquals(0, invocations.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsRunsTheContinuationOnceWhenItFails() {
+        withIndexAwareTestAction((action, searchService) -> {
+            // Two processors that resolve inline: the continuation (standing in for the coordinator
+            // rewrite) throwing must reach the request's listener once, and must not be mistaken for a
+            // processor failure and run again by each processor's listener in turn.
+            IndexAwareSearchRequestProcessor first = (source, context, listener) -> listener.onResponse(source);
+            IndexAwareSearchRequestProcessor second = (source, context, listener) -> listener.onResponse(source);
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(first, second));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicInteger completions = new AtomicInteger();
+            List<Exception> failures = new CopyOnWriteArrayList<>();
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), failures::add),
+                () -> {
+                    completions.incrementAndGet();
+                    throw new IllegalStateException("downstream rewrite boom");
+                }
+            );
+            assertEquals(1, completions.get());
+            assertEquals(1, failures.size());
+            assertEquals("downstream rewrite boom", failures.get(0).getMessage());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsReportsAContinuationFailureAfterAnAsyncProcessor() throws Exception {
+        withIndexAwareTestAction((action, searchService) -> {
+            // The processor resolves on another thread, where nothing is waiting to catch what the
+            // continuation throws: it has to reach the request's listener, or the search never responds.
+            IndexAwareSearchRequestProcessor async = (source, context, listener) -> threadPool.generic()
+                .execute(() -> listener.onResponse(source));
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(async));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicInteger completions = new AtomicInteger();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            CountDownLatch failed = new CountDownLatch(1);
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> {
+                    failure.set(e);
+                    failed.countDown();
+                }),
+                () -> {
+                    completions.incrementAndGet();
+                    throw new IllegalStateException("downstream rewrite boom");
+                }
+            );
+            try {
+                assertTrue("the request's listener was never notified", failed.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("interrupted");
+            }
+            assertEquals("downstream rewrite boom", failure.get().getMessage());
+            assertEquals(1, completions.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsDoesNotHoldTheCallingThreadWhileAProcessorWaits() {
+        withIndexAwareTestAction((action, searchService) -> {
+            // The hook is called on whatever thread reached it: for a REST search, a transport worker.
+            // A processor that hasn't resolved yet must not keep that thread: the call returns, and the
+            // search continues later, on the thread the processor resolves on.
+            AtomicReference<ActionListener<SearchSourceBuilder>> parked = new AtomicReference<>();
+            AtomicReference<SearchSourceBuilder> parkedSource = new AtomicReference<>();
+            IndexAwareSearchRequestProcessor waiting = (source, context, listener) -> {
+                parkedSource.set(source);
+                parked.set(listener);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(waiting));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicReference<Thread> completedOn = new AtomicReference<>();
+            CountDownLatch completed = new CountDownLatch(1);
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> fail(e.getMessage())),
+                () -> {
+                    completedOn.set(Thread.currentThread());
+                    completed.countDown();
+                }
+            );
+            // Returned to us with the processor still outstanding and nothing downstream started.
+            assertNotNull(parked.get());
+            assertEquals(1, completed.getCount());
+
+            threadPool.generic().execute(() -> parked.get().onResponse(parkedSource.get()));
+            try {
+                assertTrue(completed.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("interrupted");
+            }
+            assertNotSame(Thread.currentThread(), completedOn.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsIgnoresASecondResolution() {
+        withIndexAwareTestAction((action, searchService) -> {
+            IndexAwareSearchRequestProcessor resolvesTwice = (source, context, listener) -> {
+                listener.onResponse(source);
+                listener.onResponse(source);
+                listener.onFailure(new RuntimeException("and then fails"));
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(resolvesTwice));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicInteger completions = new AtomicInteger();
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> fail(e.getMessage())),
+                completions::incrementAndGet
+            );
+            assertEquals(1, completions.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsRestoresTheRequestThreadContext() {
+        withIndexAwareTestAction((action, searchService) -> {
+            // The processor resolves on another thread, in a context of its own that also carries the
+            // sub-search marker, as a sub-search's callback does. Both the next processor and the
+            // continuation must see the request's context instead.
+            ThreadContext threadContext = threadPool.getThreadContext();
+            AtomicReference<String> seenByNextProcessor = new AtomicReference<>();
+            AtomicBoolean nextProcessorMarked = new AtomicBoolean();
+            AtomicReference<String> seenByContinuation = new AtomicReference<>();
+            AtomicBoolean continuationMarked = new AtomicBoolean();
+            IndexAwareSearchRequestProcessor async = (source, context, listener) -> threadPool.generic().execute(() -> {
+                try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+                    threadContext.putHeader("who", "the processor's callback");
+                    threadContext.putTransient(SubSearchMarker.SUB_SEARCH_TRANSIENT_NAME, Boolean.TRUE);
+                    listener.onResponse(source);
+                }
+            });
+            IndexAwareSearchRequestProcessor nextProcessor = (source, context, listener) -> {
+                seenByNextProcessor.set(threadContext.getHeader("who"));
+                nextProcessorMarked.set(SubSearchMarker.isMarked(threadContext));
+                listener.onResponse(source);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(async, nextProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            CountDownLatch latch = new CountDownLatch(1);
+            try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+                threadContext.putHeader("who", "the request");
+                action.maybeApplyIndexAwareSearchRequestProcessors(
+                    searchRequest,
+                    null,
+                    null,
+                    new SearchTimeProvider(0, 0, () -> 0),
+                    ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> fail(e.getMessage())),
+                    () -> {
+                        seenByContinuation.set(threadContext.getHeader("who"));
+                        continuationMarked.set(SubSearchMarker.isMarked(threadContext));
+                        latch.countDown();
+                    }
+                );
+            }
+            try {
+                assertTrue(latch.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("interrupted");
+            }
+            assertEquals("the request", seenByNextProcessor.get());
+            assertFalse(nextProcessorMarked.get());
+            assertEquals("the request", seenByContinuation.get());
+            assertFalse(continuationMarked.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsStopsWhenTheSearchTaskIsCancelled() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger invocations = new AtomicInteger();
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                invocations.incrementAndGet();
+                listener.onResponse(source);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(recordingProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            CancellableTask cancelledTask = mock(CancellableTask.class);
+            when(cancelledTask.isCancelled()).thenReturn(true);
+            AtomicInteger completions = new AtomicInteger();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                cancelledTask,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), failure::set),
+                completions::incrementAndGet
+            );
+            assertThat(failure.get(), instanceOf(TaskCancelledException.class));
+            assertEquals(0, invocations.get());
+            assertEquals(0, completions.get());
+        });
+    }
+
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsGivesProcessorsTheSearchTaskAndMinNodeVersion() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicReference<IndexAwareContext> seen = new AtomicReference<>();
+            IndexAwareSearchRequestProcessor recordingProcessor = (source, context, listener) -> {
+                seen.set(context);
+                listener.onResponse(source);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(recordingProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            Task task = new Task(42L, "transport", SearchAction.NAME, "", TaskId.EMPTY_TASK_ID, Collections.emptyMap());
+            CountDownLatch latch = new CountDownLatch(1);
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                task,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> fail(e.getMessage())),
+                latch::countDown
+            );
+            assertEquals(0, latch.getCount());
+            assertEquals(new TaskId("local-node-id", 42L), seen.get().getSearchTaskId());
+            assertEquals(Version.CURRENT, seen.get().getMinNodeVersion());
+        });
+    }
+
+    /**
+     * Builds a {@link TransportSearchAction} wired for the {@code maybeApplyIndexAwareSearchRequestProcessors}
+     * tests above -- a cluster with {@code my-index} and the system index {@code .system-index}, and a mocked
+     * {@link SearchService} already stubbed with a real {@link IndexMappingSourceCache} and
+     * {@code anyIndexAwareSearchRequestProcessorAppliesToInternalSearches()} defaulting to {@code false} -- then
+     * runs {@code test} against it, and closes the transport service it needed regardless of how {@code test}
+     * exits. Each test only has to stub {@code getIndexAwareSearchRequestProcessors()} (and that one flag, if
+     * it needs to opt a processor into internal searches).
+     */
+    private void withIndexAwareTestAction(BiConsumer<TransportSearchAction, SearchService> test) {
+        IndexMetadata.Builder myIndex = IndexMetadata.builder("my-index")
+            .settings(settings(Version.CURRENT))
+            .numberOfShards(1)
+            .numberOfReplicas(1);
+        IndexMetadata.Builder systemIndex = IndexMetadata.builder(".system-index")
+            .settings(settings(Version.CURRENT))
+            .system(true)
+            .numberOfShards(1)
+            .numberOfReplicas(1);
+        DiscoveryNode localNode = new DiscoveryNode("local-node-id", buildNewFakeTransportAddress(), Version.CURRENT);
+        ClusterState clusterState = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(myIndex).put(systemIndex))
+            .nodes(DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()))
+            .build();
+
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(clusterState);
+        when(clusterService.localNode()).thenReturn(localNode);
+        when(clusterService.getClusterSettings()).thenReturn(
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+        );
+        IndexNameExpressionResolver indexNameExpressionResolver = new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
+        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry(Collections.emptyList());
+
+        SearchTransportService searchTransportService = mock(SearchTransportService.class);
+        MockTransportService mockTransportService = MockTransportService.createNewService(
+            Settings.EMPTY,
+            Version.CURRENT,
+            threadPool,
+            NoopTracer.INSTANCE
+        );
+        mockTransportService.start();
+        mockTransportService.acceptIncomingRequests();
+        when(searchTransportService.getRemoteClusterService()).thenReturn(mockTransportService.getRemoteClusterService());
+        try {
+            SearchService searchService = mock(SearchService.class);
+            when(searchService.getIndexMappingSourceCache()).thenReturn(new IndexMappingSourceCache());
+            when(searchService.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches()).thenReturn(false);
+
+            TransportSearchAction action = new TransportSearchAction(
+                mock(NodeClient.class),
+                threadPool,
+                mock(CircuitBreakerService.class),
+                mock(TransportService.class),
+                searchService,
+                searchTransportService,
+                new SearchPhaseController(namedWriteableRegistry, (searchSourceBuilder) -> null),
+                clusterService,
+                mock(ActionFilters.class),
+                indexNameExpressionResolver,
+                namedWriteableRegistry,
+                mock(SearchPipelineService.class),
+                mock(MetricsRegistry.class),
+                new SearchRequestOperationsCompositeListenerFactory(),
+                mock(Tracer.class),
+                mock(TaskResourceTrackingService.class),
+                mock(IndicesService.class),
+                SearchExecutionGate.NOOP,
+                SearchCancelAfterTimeIntervalResolver.NOOP
+            );
+
+            test.accept(action, searchService);
+        } finally {
+            mockTransportService.close();
+        }
+    }
+
+    /**
+     * Calls {@code action.maybeApplyIndexAwareSearchRequestProcessors} and blocks until its completion
+     * callback runs -- needed because {@link IndexAwareSearchRequestProcessor#process} is listener-based, so a
+     * registered processor (unlike the trivial ones above) may resolve asynchronously, on some other thread.
+     */
+    private static void runAndAwait(TransportSearchAction action, SearchRequest searchRequest, Task parentTask) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        action.maybeApplyIndexAwareSearchRequestProcessors(
+            searchRequest,
+            null,
+            parentTask,
+            new SearchTimeProvider(0, 0, () -> 0),
+            ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> fail(e.getMessage())),
+            latch::countDown
+        );
+        try {
+            assertTrue("timed out waiting for maybeApplyIndexAwareSearchRequestProcessors", latch.await(10, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("interrupted while waiting for maybeApplyIndexAwareSearchRequestProcessors");
         }
     }
 
