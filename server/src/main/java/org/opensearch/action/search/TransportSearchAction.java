@@ -636,12 +636,26 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 };
                 maybeApplyIndexAwareSearchRequestProcessors(sr, task, parentTask, timeProvider, listener, continueWithRewrite);
             }, listener::onFailure);
-            try {
-                searchRequest.transformRequest(requestTransformListener);
-            } catch (Exception e) {
-                // Same listener as the async failure path; it wraps updatedListener, so the permit is still released.
-                listener.onFailure(e);
-            }
+            // The pipeline itself (its system-generated pre stage, the user's own pipeline, and its
+            // system-generated post stage) runs inside transformRequest below; a BEFORE_PIPELINE processor
+            // has to run ahead of all of that, not just ahead of the AFTER_PIPELINE dispatch above.
+            final Runnable runPipelineThenRewrite = () -> {
+                try {
+                    searchRequest.transformRequest(requestTransformListener);
+                } catch (Exception e) {
+                    // Same listener as the async failure path; it wraps updatedListener, so the permit is still released.
+                    listener.onFailure(e);
+                }
+            };
+            maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                task,
+                parentTask,
+                timeProvider,
+                IndexAwareSearchRequestProcessor.ExecutionStage.BEFORE_PIPELINE,
+                listener,
+                runPipelineThenRewrite
+            );
         }
     }
 
@@ -684,21 +698,15 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
     }
 
     /**
-     * Runs any plugin-registered {@link IndexAwareSearchRequestProcessor}s on {@code searchRequest}'s source,
-     * then calls {@code onComplete}. Runs after search pipeline request processors and before the normal
-     * coordinator query rewrite ({@code Rewriteable.rewrite}), so a processor's own output (e.g. a composite
-     * query) still fans out and rewrites normally afterward.
+     * Runs any {@link IndexAwareSearchRequestProcessor#getExecutionStage} {@code AFTER_PIPELINE} processors
+     * on {@code searchRequest}'s source, then calls {@code onComplete}. The AFTER_PIPELINE stage is this
+     * hook's original (and still most common) position: after any search pipeline request processors have
+     * run and before the normal coordinator query rewrite ({@code Rewriteable.rewrite}), so a processor's
+     * own output (e.g. a composite query) still fans out and rewrites normally afterward.
      * <p>
-     * Calls {@code onComplete} directly, on the calling thread, with {@code searchRequest} untouched, when
-     * the hook doesn't apply; see {@link #prepareIndexAwareDispatch}. With no processors registered or the
-     * setting off that costs one volatile read.
-     * <p>
-     * Does not fork onto any thread pool: {@link IndexAwareSearchRequestProcessor#process} is
-     * listener-based, so nothing here ever blocks a thread waiting on a processor.
-     * <p>
-     * Exactly one of {@code onComplete} and {@code listener.onFailure} is called, exactly once, in the
-     * thread context this method was called with. A failure of {@code onComplete} itself (i.e. of the
-     * coordinator rewrite that follows) goes to {@code listener}, and is never attributed to a processor.
+     * Thin wrapper over {@link #maybeApplyIndexAwareSearchRequestProcessors(SearchRequest, Task, Task,
+     * SearchTimeProvider, IndexAwareSearchRequestProcessor.ExecutionStage, ActionListener, Runnable)}; see
+     * that overload for the full contract, including {@code BEFORE_PIPELINE}.
      *
      * @param searchRequest the request to run processors against
      * @param task          this search's own task, or {@code null}; processors parent their own requests
@@ -722,9 +730,69 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         ActionListener<SearchResponse> listener,
         Runnable onComplete
     ) {
+        maybeApplyIndexAwareSearchRequestProcessors(
+            searchRequest,
+            task,
+            parentTask,
+            timeProvider,
+            IndexAwareSearchRequestProcessor.ExecutionStage.AFTER_PIPELINE,
+            listener,
+            onComplete
+        );
+    }
+
+    /**
+     * Runs any plugin-registered {@link IndexAwareSearchRequestProcessor}s at {@code stage} on
+     * {@code searchRequest}'s source, then calls {@code onComplete}.
+     * <p>
+     * Calls {@code onComplete} directly, on the calling thread, with {@code searchRequest} untouched, when
+     * the hook doesn't apply; see {@link #prepareIndexAwareDispatch}. With no processors registered, the
+     * setting off, or no registered processor at {@code stage}, that costs one volatile read plus a cheap
+     * stream filter over an already-small list.
+     * <p>
+     * Does not fork onto any thread pool: {@link IndexAwareSearchRequestProcessor#process} is
+     * listener-based, so nothing here ever blocks a thread waiting on a processor.
+     * <p>
+     * Exactly one of {@code onComplete} and {@code listener.onFailure} is called, exactly once, in the
+     * thread context this method was called with. A failure of {@code onComplete} itself (i.e. of whatever
+     * runs next -- the search pipeline, for {@code BEFORE_PIPELINE}, or the coordinator rewrite, for
+     * {@code AFTER_PIPELINE}) goes to {@code listener}, and is never attributed to a processor.
+     *
+     * @param searchRequest the request to run processors against
+     * @param task          this search's own task, or {@code null}; processors parent their own requests
+     *                      to it, and a cancelled task stops the chain
+     * @param parentTask    the task that issued this search, or {@code null}; reused from
+     *                      {@link #extractParentTask} rather than re-resolved, to classify
+     *                      {@link IndexAwareSearchRequestScope#isInternalByDefault}
+     * @param timeProvider  this search's own time provider, reused for index resolution rather than a
+     *                      freshly sampled timestamp, so a date-math index name resolves the same way here
+     *                      as it does for the search that actually executes
+     * @param stage         which registered processors to run: see
+     *                      {@link IndexAwareSearchRequestProcessor#getExecutionStage()}. A
+     *                      {@code BEFORE_PIPELINE} processor's resolved {@link IndexAwareContext} reflects
+     *                      {@code searchRequest} as it exists at the time of this call, which for
+     *                      {@code BEFORE_PIPELINE} is before any search pipeline request processor has run.
+     * @param listener      the request's response listener, notified only of failure
+     * @param onComplete    called once processors at {@code stage} have run (or been skipped)
+     */
+    // Package-private rather than private, so TransportSearchActionTests can exercise it directly without
+    // the full doExecute pipeline.
+    void maybeApplyIndexAwareSearchRequestProcessors(
+        SearchRequest searchRequest,
+        @Nullable Task task,
+        @Nullable Task parentTask,
+        SearchTimeProvider timeProvider,
+        IndexAwareSearchRequestProcessor.ExecutionStage stage,
+        ActionListener<SearchResponse> listener,
+        Runnable onComplete
+    ) {
+        final List<IndexAwareSearchRequestProcessor> registered = searchService.getIndexAwareSearchRequestProcessors()
+            .stream()
+            .filter(processor -> processor.getExecutionStage() == stage)
+            .collect(Collectors.toList());
         final IndexAwareDispatch dispatch;
         try {
-            dispatch = prepareIndexAwareDispatch(searchRequest, task, parentTask, timeProvider);
+            dispatch = prepareIndexAwareDispatch(registered, searchRequest, task, parentTask, timeProvider);
         } catch (Exception e) {
             listener.onFailure(e);
             return;
@@ -762,14 +830,15 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
     }
 
     /**
-     * Decides whether the hook applies to {@code searchRequest} and, if so, with which processors and
-     * what context; {@code null} if it doesn't apply. Checks run cheapest first, so a request the hook
-     * doesn't apply to pays as little as possible:
+     * Decides whether the hook applies to {@code searchRequest} for {@code registered} and, if so, with
+     * which processors and what context; {@code null} if it doesn't apply. Checks run cheapest first, so
+     * a request the hook doesn't apply to pays as little as possible:
      * <ol>
-     *   <li>no source, no registered processors (including when
+     *   <li>no source, {@code registered} empty (including when
      *       {@code search.index_aware_search_request_processors.enabled} is {@code false} &mdash; see
-     *       {@link SearchService#getIndexAwareSearchRequestProcessors()}), or a sub-search a processor
-     *       itself issued (see {@link SubSearchMarker});</li>
+     *       {@link SearchService#getIndexAwareSearchRequestProcessors()} -- or no processor is registered
+     *       at the caller's chosen {@link IndexAwareSearchRequestProcessor.ExecutionStage}), or a
+     *       sub-search a processor itself issued (see {@link SubSearchMarker});</li>
      *   <li>a by-query/reindex search no processor opted into, or a search forwarded here by a remote
      *       CCS coordinator;</li>
      *   <li>no processor's {@link IndexAwareSearchRequestProcessor#mayApplyTo} accepts the source;</li>
@@ -777,23 +846,29 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
      *       opted into.</li>
      * </ol>
      * The source is copied last, only once some processor is actually going to run.
+     *
+     * @param registered the already stage-filtered, already enabled-checked candidate processors; see
+     *                   {@link #maybeApplyIndexAwareSearchRequestProcessors(SearchRequest, Task, Task,
+     *                   SearchTimeProvider, IndexAwareSearchRequestProcessor.ExecutionStage, ActionListener,
+     *                   Runnable)}
      */
     private IndexAwareDispatch prepareIndexAwareDispatch(
+        List<IndexAwareSearchRequestProcessor> registered,
         SearchRequest searchRequest,
         @Nullable Task task,
         @Nullable Task parentTask,
         SearchTimeProvider timeProvider
     ) {
-        final List<IndexAwareSearchRequestProcessor> registered = searchService.getIndexAwareSearchRequestProcessors();
         final SearchSourceBuilder source = searchRequest.source();
         if (source == null || registered.isEmpty() || SubSearchMarker.isMarked(threadPool.getThreadContext())) {
             return null;
         }
         // Known before any index resolution. (The other half of isInternalByDefault, system-index
-        // targets, needs the resolution below.) Precomputed once on SearchService, not rescanned per
-        // request.
+        // targets, needs the resolution below.) registered is already filtered to this call's stage and
+        // is small (one entry per plugin that registered a processor at this stage), so a plain scan here
+        // is cheap -- no need for SearchService to precompute this per stage.
         if (parentTask instanceof BulkByScrollTask
-            && searchService.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches() == false) {
+            && registered.stream().noneMatch(IndexAwareSearchRequestProcessor::appliesToInternalSearches)) {
             return null;
         }
         // A search this node is running on behalf of a remote CCS coordinator (a forwarded sub-request,

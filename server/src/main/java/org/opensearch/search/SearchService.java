@@ -127,7 +127,6 @@ import org.opensearch.search.fetch.subphase.ScriptFieldsContext.ScriptField;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
 import org.opensearch.search.indexaware.IndexAwareContext;
 import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
-import org.opensearch.search.indexaware.IndexAwareSearchRequestScope;
 import org.opensearch.search.indexaware.IndexMappingSourceCache;
 import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.InternalScrollSearchRequest;
@@ -548,11 +547,6 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     private final List<IndexAwareSearchRequestProcessor> indexAwareSearchRequestProcessors;
 
-    // Precomputed once, not per request: the processors list is fixed for this SearchService's lifetime,
-    // so there's no need to re-scan it on every search just to decide whether an internal search can skip
-    // the hook outright.
-    private final boolean anyIndexAwareSearchRequestProcessorAppliesToInternalSearches;
-
     private final IndexMappingSourceCache indexMappingSourceCache = new IndexMappingSourceCache();
 
     private volatile boolean indexAwareSearchRequestProcessorsEnabled;
@@ -648,8 +642,6 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         this.pluginProfilers = pluginProfilers;
 
         this.indexAwareSearchRequestProcessors = indexAwareSearchRequestProcessors;
-        this.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches = indexAwareSearchRequestProcessors.stream()
-            .anyMatch(IndexAwareSearchRequestProcessor::appliesToInternalSearches);
         this.indexAwareSearchRequestProcessorsEnabled = INDEX_AWARE_SEARCH_REQUEST_PROCESSORS_ENABLED_SETTING.get(settings);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(
@@ -691,16 +683,6 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
      */
     public List<IndexAwareSearchRequestProcessor> getIndexAwareSearchRequestProcessors() {
         return indexAwareSearchRequestProcessorsEnabled ? indexAwareSearchRequestProcessors : Collections.emptyList();
-    }
-
-    /**
-     * Whether any registered {@link IndexAwareSearchRequestProcessor} opted in to run even for a search
-     * {@link IndexAwareSearchRequestScope#isInternalByDefault} classifies
-     * as internal. Precomputed once at construction, not re-scanned per request, so the common case (a
-     * {@code BulkByScrollTask} parent, no opted-in processor) can skip resolving indices at all.
-     */
-    public boolean anyIndexAwareSearchRequestProcessorAppliesToInternalSearches() {
-        return anyIndexAwareSearchRequestProcessorAppliesToInternalSearches;
     }
 
     /**

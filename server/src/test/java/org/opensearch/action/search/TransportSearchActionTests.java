@@ -110,6 +110,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.indexaware.IndexAwareContext;
 import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor;
+import org.opensearch.search.indexaware.IndexAwareSearchRequestProcessor.ExecutionStage;
 import org.opensearch.search.indexaware.IndexMappingSourceCache;
 import org.opensearch.search.indexaware.SubSearchMarker;
 import org.opensearch.search.internal.AliasFilter;
@@ -2142,7 +2143,6 @@ public class TransportSearchActionTests extends OpenSearchTestCase {
                 }
             };
             when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(optedInProcessor));
-            when(searchService.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches()).thenReturn(true);
             Task reindexParentTask = new ReindexRequest().createTask(1, "transport", ReindexAction.NAME, TaskId.EMPTY_TASK_ID, Map.of());
             SearchRequest internalSearchOptedIn = new SearchRequest("my-index").source(new SearchSourceBuilder());
             runAndAwait(action, internalSearchOptedIn, reindexParentTask);
@@ -2537,14 +2537,125 @@ public class TransportSearchActionTests extends OpenSearchTestCase {
         });
     }
 
+    // Two processors registered, one at each stage: dispatching BEFORE_PIPELINE runs only the
+    // before-pipeline processor, leaving the after-pipeline one untouched.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsBeforePipelineStageRunsOnlyThatStagesProcessor() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger beforeInvocations = new AtomicInteger();
+            AtomicInteger afterInvocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor beforeProcessor = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    beforeInvocations.incrementAndGet();
+                    listener.onResponse(rewritten);
+                }
+
+                @Override
+                public ExecutionStage getExecutionStage() {
+                    return ExecutionStage.BEFORE_PIPELINE;
+                }
+            };
+            // No override: defaults to AFTER_PIPELINE.
+            IndexAwareSearchRequestProcessor afterProcessor = (source, context, listener) -> {
+                afterInvocations.incrementAndGet();
+                listener.onResponse(source);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(beforeProcessor, afterProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            CountDownLatch latch = new CountDownLatch(1);
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ExecutionStage.BEFORE_PIPELINE,
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), e -> fail(e.getMessage())),
+                latch::countDown
+            );
+            assertEquals(0, latch.getCount());
+            assertSame(rewritten, searchRequest.source());
+            assertEquals(1, beforeInvocations.get());
+            assertEquals(0, afterInvocations.get());
+        });
+    }
+
+    // Same two processors as above, dispatched at AFTER_PIPELINE instead: runs only the (default-staged)
+    // after-pipeline processor, leaving the before-pipeline one untouched -- the symmetric case.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsAfterPipelineStageRunsOnlyThatStagesProcessor() {
+        withIndexAwareTestAction((action, searchService) -> {
+            AtomicInteger beforeInvocations = new AtomicInteger();
+            AtomicInteger afterInvocations = new AtomicInteger();
+            SearchSourceBuilder rewritten = new SearchSourceBuilder();
+            IndexAwareSearchRequestProcessor beforeProcessor = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    beforeInvocations.incrementAndGet();
+                    listener.onResponse(source);
+                }
+
+                @Override
+                public ExecutionStage getExecutionStage() {
+                    return ExecutionStage.BEFORE_PIPELINE;
+                }
+            };
+            // No override: defaults to AFTER_PIPELINE.
+            IndexAwareSearchRequestProcessor afterProcessor = (source, context, listener) -> {
+                afterInvocations.incrementAndGet();
+                listener.onResponse(rewritten);
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(beforeProcessor, afterProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            runAndAwait(action, searchRequest, null);
+            assertSame(rewritten, searchRequest.source());
+            assertEquals(0, beforeInvocations.get());
+            assertEquals(1, afterInvocations.get());
+        });
+    }
+
+    // A BEFORE_PIPELINE processor that fails still fails the search by default, the same fail-closed
+    // behavior AFTER_PIPELINE already has (testMaybeApplyIndexAwareSearchRequestProcessorsFailsTheSearchWhenAProcessorThrows):
+    // the dispatch-and-failure machinery is shared between both stages, only the processor list differs.
+    public void testMaybeApplyIndexAwareSearchRequestProcessorsBeforePipelineStageFailsTheSearchWhenAProcessorThrows() {
+        withIndexAwareTestAction((action, searchService) -> {
+            IndexAwareSearchRequestProcessor throwingBeforeProcessor = new IndexAwareSearchRequestProcessor() {
+                @Override
+                public void process(SearchSourceBuilder source, IndexAwareContext context, ActionListener<SearchSourceBuilder> listener) {
+                    throw new RuntimeException("before-pipeline processor boom");
+                }
+
+                @Override
+                public ExecutionStage getExecutionStage() {
+                    return ExecutionStage.BEFORE_PIPELINE;
+                }
+            };
+            when(searchService.getIndexAwareSearchRequestProcessors()).thenReturn(List.of(throwingBeforeProcessor));
+            SearchRequest searchRequest = new SearchRequest("my-index").source(new SearchSourceBuilder());
+            AtomicInteger completions = new AtomicInteger();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            action.maybeApplyIndexAwareSearchRequestProcessors(
+                searchRequest,
+                null,
+                null,
+                new SearchTimeProvider(0, 0, () -> 0),
+                ExecutionStage.BEFORE_PIPELINE,
+                ActionListener.wrap(response -> fail("not expected to complete via the listener"), failure::set),
+                completions::incrementAndGet
+            );
+            assertNotNull(failure.get());
+            assertEquals("before-pipeline processor boom", failure.get().getMessage());
+            assertEquals(0, completions.get());
+        });
+    }
+
     /**
      * Builds a {@link TransportSearchAction} wired for the {@code maybeApplyIndexAwareSearchRequestProcessors}
      * tests above -- a cluster with {@code my-index} and the system index {@code .system-index}, and a mocked
-     * {@link SearchService} already stubbed with a real {@link IndexMappingSourceCache} and
-     * {@code anyIndexAwareSearchRequestProcessorAppliesToInternalSearches()} defaulting to {@code false} -- then
-     * runs {@code test} against it, and closes the transport service it needed regardless of how {@code test}
-     * exits. Each test only has to stub {@code getIndexAwareSearchRequestProcessors()} (and that one flag, if
-     * it needs to opt a processor into internal searches).
+     * {@link SearchService} already stubbed with a real {@link IndexMappingSourceCache} -- then runs
+     * {@code test} against it, and closes the transport service it needed regardless of how {@code test}
+     * exits. Each test only has to stub {@code getIndexAwareSearchRequestProcessors()}; a processor opts
+     * into internal searches via its own {@code appliesToInternalSearches()} override, not a separate
+     * {@code SearchService}-level flag.
      */
     private void withIndexAwareTestAction(BiConsumer<TransportSearchAction, SearchService> test) {
         IndexMetadata.Builder myIndex = IndexMetadata.builder("my-index")
@@ -2584,7 +2695,6 @@ public class TransportSearchActionTests extends OpenSearchTestCase {
         try {
             SearchService searchService = mock(SearchService.class);
             when(searchService.getIndexMappingSourceCache()).thenReturn(new IndexMappingSourceCache());
-            when(searchService.anyIndexAwareSearchRequestProcessorAppliesToInternalSearches()).thenReturn(false);
 
             TransportSearchAction action = new TransportSearchAction(
                 mock(NodeClient.class),

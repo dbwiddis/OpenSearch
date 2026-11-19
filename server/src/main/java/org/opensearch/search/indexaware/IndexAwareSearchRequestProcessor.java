@@ -30,7 +30,8 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  *       (including mappings), via {@link IndexAwareContext}, so it can be correct per index
  *       (for example across an alias where one index has a feature mapped and another doesn't);</li>
  *   <li>always runs, regardless of which (or no) search pipeline is attached to the request, and can't
- *       be bypassed with {@code ?search_pipeline=_none}.</li>
+ *       be bypassed with {@code ?search_pipeline=_none};</li>
+ *   <li>can run before the whole search pipeline instead of after it, via {@link #getExecutionStage()}.</li>
  * </ul>
  * Not every implementation rewrites the query: a processor may instead act purely on {@code size},
  * {@code from}, aggregations, or other source fields, the same way some pipeline request processors do
@@ -155,5 +156,38 @@ public interface IndexAwareSearchRequestProcessor {
      */
     default String getName() {
         return getClass().getSimpleName();
+    }
+
+    /**
+     * Where this processor runs relative to the search pipeline (the same user-configured pipeline,
+     * including its system-generated pre/post stages, that {@code SearchRequestProcessor}s run in).
+     * Defaults to {@link ExecutionStage#AFTER_PIPELINE}, matching this hook's original (and still most
+     * common) position: after any search pipeline request processors have run, and before the normal
+     * coordinator query rewrite.
+     * <p>
+     * Mirrors {@code SystemGeneratedProcessor#getExecutionStage()}'s {@code PRE_USER_DEFINED}/
+     * {@code POST_USER_DEFINED} shape -- the parity this extension point is meant to have with
+     * system-generated search processors -- but is a separate enum, not a shared one: the two mechanisms
+     * are deliberately independent (see the companion RFC), and this hook's "before" position is relative
+     * to the whole pipeline (every stage SGSP itself can occupy), not just the user's own part of it.
+     * <p>
+     * A {@link ExecutionStage#BEFORE_PIPELINE} processor's {@link IndexAwareContext} is resolved against
+     * the request as it existed before the pipeline ran; if a pipeline processor later changes which
+     * indices the request targets, a before-pipeline processor's view of the target indices can disagree
+     * with what the request actually executes against. No shipped search pipeline processor does this
+     * today, but the interface doesn't forbid it.
+     */
+    default ExecutionStage getExecutionStage() {
+        return ExecutionStage.AFTER_PIPELINE;
+    }
+
+    /**
+     * The stage to execute the processor, relative to the search pipeline. See {@link #getExecutionStage()}.
+     */
+    enum ExecutionStage {
+        /** Before the search pipeline (its system-generated pre stage, the user's own pipeline, and its system-generated post stage). */
+        BEFORE_PIPELINE,
+        /** After the search pipeline; the default. */
+        AFTER_PIPELINE,
     }
 }
